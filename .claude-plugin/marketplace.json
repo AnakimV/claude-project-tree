@@ -1,0 +1,14 @@
+{
+  "name": "ai-expand",
+  "owner": {
+    "name": "AnakimV"
+  },
+  "description": "Моды для Claude Code: дерево проекта в панели рядом с чатом.",
+  "plugins": [
+    {
+      "name": "project-tree",
+      "source": "./project-tree",
+      "description": "Дерево проекта: схема веток и задач, вопросы, идеи, находки и история важных шагов"
+    }
+  ]
+}
