@@ -1,37 +1,30 @@
 import type { Color } from 'claude-code'
 
 import type { Anchor, EventKind, HistoryEvent, NodeKind, NodeStatus, Tray, TreeNode } from '../types'
+import { STRINGS, t } from './strings'
 
 // Colors are theme keys, so both light and dark themes keep them readable.
-export const KINDS: Record<NodeKind, { label: string; icon: string; color: Color }> = {
-  branch: { label: 'ветка', icon: '▤', color: 'claude' },
-  task: { label: 'задача', icon: '○', color: 'suggestion' },
-  question: { label: 'вопрос', icon: '?', color: 'warning' },
-  decision: { label: 'решение', icon: '◇', color: 'merged' },
-  idea: { label: 'идея', icon: '✦', color: 'planMode' },
-  finding: { label: 'находка', icon: '⚑', color: 'success' },
-  note: { label: 'заметка', icon: '·', color: 'inactive' },
+// Labels are in strings.ts, in each language.
+export const KINDS: Record<NodeKind, { icon: string; color: Color }> = {
+  branch: { icon: '▤', color: 'claude' },
+  task: { icon: '○', color: 'suggestion' },
+  question: { icon: '?', color: 'warning' },
+  decision: { icon: '◇', color: 'merged' },
+  idea: { icon: '✦', color: 'planMode' },
+  finding: { icon: '⚑', color: 'success' },
+  note: { icon: '·', color: 'inactive' },
 }
 
-export const STATUSES: Record<NodeStatus, string> = {
-  open: 'открыто',
-  doing: 'в работе',
-  done: 'готово',
-  parked: 'отложено',
-}
+export const STATUSES: readonly NodeStatus[] = ['open', 'doing', 'done', 'parked']
 
-export const TRAYS: Record<Tray, { label: string; empty: string }> = {
-  questions: { label: 'Вопросы', empty: 'Открытых вопросов и решений нет.' },
-  ideas: { label: 'Идеи', empty: 'Идей пока нет. Сюда же попадают задачи от Claude без ветки.' },
-  findings: { label: 'Находки', empty: 'Находок и заметок пока нет.' },
-}
+export const TRAYS: readonly Tray[] = ['questions', 'ideas', 'findings']
 
-export const EVENTS: Record<EventKind, { icon: string; color: Color; lead: string }> = {
-  done: { icon: '✓', color: 'suggestion', lead: 'Закрыта: ' },
-  answered: { icon: '✓', color: 'warning', lead: 'Ответили: ' },
-  decided: { icon: '◆', color: 'merged', lead: 'Решили: ' },
-  removed: { icon: '✕', color: 'error', lead: 'Убрали: ' },
-  step: { icon: '+', color: 'success', lead: '' },
+export const EVENTS: Record<EventKind, { icon: string; color: Color }> = {
+  done: { icon: '✓', color: 'suggestion' },
+  answered: { icon: '✓', color: 'warning' },
+  decided: { icon: '◆', color: 'merged' },
+  removed: { icon: '✕', color: 'error' },
+  step: { icon: '+', color: 'success' },
 }
 
 const PREFIXES: Record<string, NodeKind> = {
@@ -44,9 +37,8 @@ const PREFIXES: Record<string, NodeKind> = {
   '~': 'note',
 }
 
-export const ENTRY_HINT = '# ветка  - задача  ? вопрос  ! решение  * идея  > находка  ~ заметка'
-
-// "? как показывать связи" or "вопрос: как показывать связи"; plain text is a task.
+// "? как показывать связи" or "вопрос: как показывать связи"; plain text is a
+// task. A kind's word is taken in any language the mod speaks.
 export function parseEntry(text: string): { kind: NodeKind; title: string } | null {
   const trimmed = text.trim()
   if (trimmed === '') return null
@@ -59,7 +51,7 @@ export function parseEntry(text: string): { kind: NodeKind; title: string } | nu
   if (word !== undefined && rest !== undefined) {
     const lower = word.toLowerCase()
     const kind = (Object.keys(KINDS) as NodeKind[]).find(
-      k => KINDS[k].label === lower || k === lower,
+      k => k === lower || Object.values(STRINGS).some(one => one.kinds[k] === lower),
     )
     if (kind) return { kind, title: rest.trim() }
   }
@@ -248,6 +240,31 @@ export function closingOf(node: TreeNode): EventKind {
   return 'done'
 }
 
+// Two sessions can hold one tree. Before a write, what this session changed
+// since `base` (its last read or write) wins; the rest is what is on disk now.
+export function mergeById<T extends { id: string }>(base: readonly T[], mine: readonly T[], disk: readonly T[]): T[] {
+  const was = new Map(base.map(one => [one.id, JSON.stringify(one)]))
+  const ours = new Map(mine.map(one => [one.id, one]))
+  const changed = new Set(mine.filter(one => was.get(one.id) !== JSON.stringify(one)).map(one => one.id))
+  const dropped = new Set(base.filter(one => !ours.has(one.id)).map(one => one.id))
+  const onDisk = new Set(disk.map(one => one.id))
+  const kept = disk.filter(one => !dropped.has(one.id)).map(one => (changed.has(one.id) ? (ours.get(one.id) ?? one) : one))
+
+  return [...kept, ...mine.filter(one => changed.has(one.id) && !onDisk.has(one.id))]
+}
+
+// A project keeps several trees in .claude: the main one under the original
+// file name, each other one under its id.
+export function treeFile(id: string): string {
+  return id === '' ? 'project-tree.json' : `project-tree-${id}.json`
+}
+
+export function treeIdOf(fileName: string): string | null {
+  const match = /^project-tree(?:-([a-z0-9]+))?\.json$/.exec(fileName)
+
+  return match ? (match[1] ?? '') : null
+}
+
 // A file written before history existed kept closed nodes in the tree: they become history.
 export function migrate(list: TreeNode[]): { nodes: TreeNode[]; events: HistoryEvent[] } {
   let rest = list.map(node => (isOnMap(node) || node.kind === 'task' ? node : { ...node, isInbox: false }))
@@ -263,54 +280,117 @@ export function migrate(list: TreeNode[]): { nodes: TreeNode[]; events: HistoryE
 }
 
 function line(node: TreeNode): string {
-  const parts = [`[${node.id}]`, KINDS[node.kind].label, `«${node.title}»`, STATUSES[node.status]]
+  const parts = [`[${node.id}]`, t().kinds[node.kind], `«${node.title}»`, t().statuses[node.status]]
   if (node.kind === 'decision') {
-    if (node.options?.length) parts.push(`варианты: ${node.options.join(' | ')}`)
-    if (node.chosen !== undefined) parts.push(`выбрано: ${node.chosen}`)
+    if (node.options?.length) parts.push(`${t().options}: ${node.options.join(' | ')}`)
+    if (node.chosen !== undefined) parts.push(`${t().chosen}: ${node.chosen}`)
   }
-  if (node.proposal) parts.push('(ждёт подтверждения)')
+  if (node.proposal) parts.push(t().awaitsYes)
 
   return parts.join(' · ')
 }
 
 export function eventTitle(event: HistoryEvent): string {
-  return `${EVENTS[event.kind].lead}${event.title}`
+  return `${t().leads[event.kind]}${event.title}`
+}
+
+// A node's line with the gist of its detail under it, so a later session reads
+// what the node is about, not only its title.
+function entry(node: TreeNode, indent: string): string[] {
+  return [`${indent}${line(node)}`, ...(node.detail ? [`${indent}    ${excerptOf(node.detail, DETAIL_GIST)}`] : [])]
+}
+
+// One node in full, for Claude's `list` with an id.
+export function nodeCard(list: TreeNode[], node: TreeNode): string {
+  const path = pathOf(list, node.id)
+  const kids = list.filter(one => one.parentId === node.id)
+
+  return [
+    line(node),
+    path.length ? t().inBranch(path.join(' › ')) : '',
+    node.detail ?? '',
+    node.anchor ? t().fromMessage(new Date(node.anchor.at).toLocaleString(t().locale), node.anchor.excerpt) : '',
+    ...kids.map(one => `  ${line(one)}`),
+  ]
+    .filter(Boolean)
+    .join('\n')
 }
 
 // The whole tree as indented text, for Claude's `list`.
 export function outline(list: TreeNode[], events: HistoryEvent[]): string {
-  const map = flatten(list, []).map(row => `${'  '.repeat(row.depth)}${line(row.node)}`)
-  const trays = (Object.keys(TRAYS) as Tray[]).flatMap(tray => {
+  const map = flatten(list, []).flatMap(row => entry(row.node, '  '.repeat(row.depth)))
+  const trays = TRAYS.flatMap(tray => {
     const items = trayList(list, tray)
-    return items.length ? ['', `${TRAYS[tray].label} (ждут решения человека):`, ...items.map(node => `  ${line(node)}`)] : []
+    return items.length ? ['', t().trayHead(t().trays[tray].label), ...items.flatMap(node => entry(node, '  '))] : []
   })
   const recent = [...events].sort((a, b) => b.at - a.at).slice(0, 10)
 
   return [
-    'Схема:',
-    ...(map.length ? map : ['  (пусто)']),
+    t().mapHead,
+    ...(map.length ? map : [t().emptyMap]),
     ...trays,
     ...(recent.length
-      ? ['', 'История, последнее:', ...recent.map(event => `  ${new Date(event.at).toLocaleDateString('ru-RU')} ${eventTitle(event)}`)]
+      ? ['', t().historyHead, ...recent.map(event => `  ${new Date(event.at).toLocaleDateString(t().locale)} ${eventTitle(event)}`)]
       : []),
   ].join('\n')
 }
 
-// A short digest for the system prompt, fixed for the session.
-export function digest(list: TreeNode[]): string {
+// A short digest for the system prompt, fixed for the session: enough to know
+// where the project stands before the first `list`.
+export function digest(list: TreeNode[], events: HistoryEvent[] = []): string {
   const ready = readyList(list)
-  if (list.length === 0) return 'Дерево проекта пока пусто.'
+  if (list.length === 0 && events.length === 0) return t().emptyTree
   const top = ready.slice(0, 8).map(node => {
     const path = pathOf(list, node.id)
-    return `- ${line(node)}${path.length ? ` (в ветке: ${path.join(' › ')})` : ''}`
+    return `- ${line(node)}${path.length ? ` (${t().inBranch(path.join(' › '))})` : ''}`
   })
-  const waiting = (Object.keys(TRAYS) as Tray[])
-    .map(tray => `${TRAYS[tray].label.toLowerCase()}: ${trayList(list, tray).length}`)
-    .join(', ')
+  const waiting = TRAYS.map(tray => `${t().trays[tray].label.toLowerCase()}: ${trayList(list, tray).length}`).join(', ')
+  const named = TRAYS.flatMap(tray => {
+    const items = trayList(list, tray)
+    const titles = items.slice(0, DIGEST_TITLES).map(node => `«${node.title}» [${node.id}]`)
+    const more = items.length > DIGEST_TITLES ? ` ${t().andMore(items.length - DIGEST_TITLES)}` : ''
+    return items.length ? [`- ${t().trays[tray].label}: ${titles.join(', ')}${more}`] : []
+  })
+  const recent = [...events].sort((a, b) => b.at - a.at).slice(0, 3)
 
   return [
-    `В дереве ${list.length} узлов, открытой работы: ${ready.length}; ждут решения — ${waiting}.`,
-    ...(top.length ? ['Открыто сейчас:', ...top] : []),
+    t().digestHead(list.length, ready.length, waiting),
+    ...(top.length ? [t().openNow, ...top] : []),
+    ...(named.length ? [t().waitingNow, ...named] : []),
+    ...(recent.length
+      ? [t().historyHead, ...recent.map(event => `- ${new Date(event.at).toLocaleDateString(t().locale)} ${eventTitle(event)}`)]
+      : []),
+  ].join('\n')
+}
+
+// What a person coming back to the project reads first: the latest steps, the
+// work in progress, what waits on them and what has lain untouched.
+export function briefing(name: string, list: TreeNode[], events: HistoryEvent[], now: number): string {
+  if (list.length === 0 && events.length === 0) return t().emptyTree
+  const recent = [...events].sort((a, b) => b.at - a.at).slice(0, 5)
+  const ready = readyList(list)
+  const doing = ready.filter(node => node.status === 'doing')
+  const open = ready.filter(node => node.status !== 'doing' && node.kind === 'task')
+  const parked = list.filter(node => node.status === 'parked')
+  const stale = list.filter(node => node.kind !== 'branch' && isStale(node, now)).sort((a, b) => a.updatedAt - b.updatedAt)
+  const titled = (node: TreeNode) => {
+    const path = pathOf(list, node.id)
+    return `  ${iconOf(node)} ${node.title}${path.length ? ` (${path.join(' › ')})` : ''}`
+  }
+  const block = (head: string, lines: string[], max = 5) =>
+    lines.length ? ['', head, ...lines.slice(0, max), ...(lines.length > max ? [`  ${t().andMore(lines.length - max)}`] : [])] : []
+
+  return [
+    t().briefHead(name),
+    ...block(t().briefRecent, recent.map(event => `  ${dayOf(event.at, now)} · ${eventTitle(event)}`)),
+    ...block(t().briefDoing, doing.map(titled)),
+    ...block(t().briefOpen(open.length), open.map(titled)),
+    ...TRAYS.flatMap(tray => {
+      const items = trayList(list, tray)
+      return block(t().briefTray(t().trays[tray].label, items.length), items.map(titled), 4)
+    }),
+    ...block(t().briefParked, parked.map(titled), 3),
+    ...block(t().briefStale, stale.map(node => `${titled(node)} · ${ageOf(node.updatedAt, now)}`), 4),
   ].join('\n')
 }
 
@@ -337,41 +417,39 @@ const HOUR = 60 * MINUTE
 const DAY = 24 * HOUR
 // Open work untouched this long is called out: it is the work that gets forgotten.
 export const STALE_DAYS = 5
-
-// The Russian noun form for n: one, few (2-4) or many.
-export function plural(n: number, forms: readonly [string, string, string]): string {
-  const tens = n % 100
-  const ones = n % 10
-  if (tens >= 11 && tens <= 14) return forms[2]
-  if (ones === 1) return forms[0]
-  if (ones >= 2 && ones <= 4) return forms[1]
-
-  return forms[2]
-}
+// A question, idea or finding may wait longer before it is called out.
+export const STALE_TRAY_DAYS = 14
+// How much of a node's detail the outline carries, and how many titles of a
+// tray the digest names.
+const DETAIL_GIST = 200
+const DIGEST_TITLES = 5
 
 // How long ago, in the largest unit that fits: "12 мин", "3 ч", "2 дня", "3 нед".
 export function ageOf(at: number, now: number): string {
   const span = Math.max(0, now - at)
-  if (span < MINUTE) return 'меньше минуты'
-  if (span < HOUR) return `${Math.floor(span / MINUTE)} мин`
-  if (span < DAY) return `${Math.floor(span / HOUR)} ч`
+  const age = t().age
+  if (span < MINUTE) return age.underMinute
+  if (span < HOUR) return age.minutes(Math.floor(span / MINUTE))
+  if (span < DAY) return age.hours(Math.floor(span / HOUR))
   const days = Math.floor(span / DAY)
-  if (days < 14) return `${days} ${plural(days, ['день', 'дня', 'дней'])}`
+  if (days < 14) return age.days(days)
 
-  return `${Math.floor(days / 7)} нед`
+  return age.weeks(Math.floor(days / 7))
 }
 
 // The heading a history day goes under: today, yesterday, else its date.
 export function dayOf(at: number, now: number): string {
   const day = (ms: number) => new Date(ms).toDateString()
-  if (day(at) === day(now)) return 'Сегодня'
-  if (day(at) === day(now - DAY)) return 'Вчера'
+  if (day(at) === day(now)) return t().today
+  if (day(at) === day(now - DAY)) return t().yesterday
 
-  return new Date(at).toLocaleDateString('ru-RU', { day: 'numeric', month: 'long' })
+  return new Date(at).toLocaleDateString(t().locale, { day: 'numeric', month: 'long' })
 }
 
 export function isStale(node: TreeNode, now: number): boolean {
-  return node.status === 'open' && now - node.updatedAt > STALE_DAYS * DAY
+  const days = trayOf(node) === null ? STALE_DAYS : STALE_TRAY_DAYS
+
+  return node.status === 'open' && now - node.updatedAt > days * DAY
 }
 
 // The node's direct subtasks: how many there are and how many are done.
@@ -384,7 +462,7 @@ export function progressOf(list: TreeNode[], id: string): { done: number; total:
 // What "Ответить" puts in the prompt box ahead of the person's answer; the id
 // in brackets is how the sent prompt is tied back to the node.
 export function replyLead(node: TreeNode): string {
-  return `↪ ${KINDS[node.kind].label} «${node.title}» [${node.id}]: `
+  return `↪ ${t().kinds[node.kind]} «${node.title}» [${node.id}]: `
 }
 
 // The ids of nodes a prompt names in brackets, as replyLead writes them.
@@ -399,7 +477,7 @@ export function mentionedIds(text: string, list: TreeNode[]): string[] {
 export function briefOf(list: TreeNode[], node: TreeNode): string {
   const path = pathOf(list, node.id)
   const lines = [
-    `The person is answering this node of their project tree: [${node.id}] ${KINDS[node.kind].label} «${node.title}», ${STATUSES[node.status]}.`,
+    `The person is answering this node of their project tree: [${node.id}] ${t().kinds[node.kind]} «${node.title}», ${t().statuses[node.status]}.`,
     path.length ? `In branch: ${path.join(' › ')}.` : '',
     node.detail ? `Detail: ${node.detail}` : '',
     node.options?.length ? `Options: ${node.options.join(' | ')}${node.chosen ? `; chosen: ${node.chosen}` : ''}.` : '',

@@ -73,6 +73,10 @@ declare module 'claude-code' {
       inputSeq: number
       // The node whose removal waits on the person's reason.
       removing: string
+      // The tree this session has open, '' for the main one; null until chosen.
+      tree: string | null
+      // The language the person writes in, which the mod speaks.
+      lang: 'ru' | 'en'
     }
   }
 }

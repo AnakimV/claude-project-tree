@@ -2,14 +2,16 @@ import { atom, read, update } from 'claude-code'
 import type { Color, EngineInterface, Register, RenderChildren } from 'claude-code'
 
 import type { Anchor, EventKind, HistoryEvent, NodeKind, NodeStatus, Tab, Tray, TreeNode } from '../types'
+import { isLang, langOf, setLang, shownName, systemLang, t } from './strings'
+import type { Lang } from './strings'
 import {
-  ENTRY_HINT,
   EVENTS,
   KINDS,
   STATUSES,
   TRAYS,
   ageOf,
   briefOf,
+  briefing,
   closingOf,
   dayOf,
   digest,
@@ -22,8 +24,10 @@ import {
   isStale,
   makeNode,
   mentionedIds,
+  mergeById,
   migrate,
   newId,
+  nodeCard,
   outline,
   parseEntry,
   patch,
@@ -35,13 +39,14 @@ import {
   textOf,
   trayList,
   trayOf,
+  treeFile,
+  treeIdOf,
 } from './tree'
 import type { Row } from './tree'
 
 const PANE = 'project-tree'
-const TITLE = 'Дерево проекта'
 const TOOL = 'mcp__project-tree__tree'
-const FILE = '.claude/project-tree.json'
+const DIR = '.claude'
 // The file's layout: 2 added history; an older file is migrated on load.
 const VERSION = 2
 
@@ -55,37 +60,154 @@ const selected = atom({ plugin: 'project-tree', key: 'selected' } as const, '')
 const lastPrompt = atom({ plugin: 'project-tree', key: 'lastPrompt' } as const, null)
 const inputSeq = atom({ plugin: 'project-tree', key: 'inputSeq' } as const, 0)
 const removing = atom({ plugin: 'project-tree', key: 'removing' } as const, '')
+const tree = atom({ plugin: 'project-tree', key: 'tree' } as const, null)
+const language = atom({ plugin: 'project-tree', key: 'lang' } as const, 'ru')
+// The person's language, kept across sessions and projects in the plugin's store.
+const LANG_KEY = 'lang'
 
 type $ = EngineInterface
+type Loaded = {
+  name: string
+  nodes: TreeNode[]
+  events: HistoryEvent[]
+  isOld: boolean
+  isMissing: boolean
+  isBroken: boolean
+}
 
-// Set at session start; a reload runs session.start again.
-let filePath = FILE
-let guide = 'Дерево проекта пока не загружено.'
+// Set at session start and on switching trees; a reload runs session.start again.
+let root = '.'
+let treeId = ''
+// As stored; the main tree's default name is shown in the pane's language.
+let treeName = ''
+let trees: { id: string; name: string }[] = []
+// What this session last read or wrote: the base its own changes are told from.
+let base: { nodes: TreeNode[]; events: HistoryEvent[] } = { nodes: [], events: [] }
+let guide = ''
 
-async function load($: $): Promise<{ nodes: TreeNode[]; events: HistoryEvent[]; isOld: boolean }> {
+const pathOfTree = (id: string) => `${root}/${DIR}/${treeFile(id)}`
+const pointerKey = () => `current:${root}`
+const openName = () => shownName(treeId, treeName)
+const today = () => new Date().toLocaleDateString(t().locale, { day: 'numeric', month: 'long' })
+
+const guideOf = (list: TreeNode[], log: HistoryEvent[]) =>
+  `${t().guide(t().title, TOOL, openName(), trees.length)}\n${digest(list, log)}`
+
+// Switches the mod to the language the person writes in.
+async function speak($: $, lang: Lang): Promise<void> {
+  setLang(lang)
+  if ((await read($, language)) === lang) return
+  await update($, language, () => lang)
+  await $.store.set(LANG_KEY, lang).catch(() => undefined)
+  trees = await listTrees($)
+  guide = guideOf(await read($, nodes), await read($, events))
+}
+
+async function load($: $, id = treeId): Promise<Loaded> {
+  const empty = { name: '', nodes: [], events: [], isOld: false, isMissing: false }
+  if (!(await $.fs.exists(pathOfTree(id)).catch(() => false))) return { ...empty, isMissing: true, isBroken: false }
   try {
-    const parsed = JSON.parse(String(await $.fs.read(filePath))) as {
+    const parsed = JSON.parse(String(await $.fs.read(pathOfTree(id)))) as {
       version?: number
+      name?: string
       nodes?: TreeNode[]
       events?: HistoryEvent[]
     }
+    const name = parsed.name ?? empty.name
     const list = Array.isArray(parsed.nodes) ? parsed.nodes : []
     if (parsed.version === VERSION) {
-      return { nodes: list, events: Array.isArray(parsed.events) ? parsed.events : [], isOld: false }
+      const log = Array.isArray(parsed.events) ? parsed.events : []
+      return { name, nodes: list, events: log, isOld: false, isMissing: false, isBroken: false }
     }
 
-    return { ...migrate(list), isOld: true }
+    return { name, ...migrate(list), isOld: true, isMissing: false, isBroken: false }
   } catch {
-    return { nodes: [], events: [], isOld: false }
+    // Half written by another session, or edited by hand: not a tree to merge with.
+    return { ...empty, isBroken: true }
   }
 }
 
+async function write($: $, id: string, name: string, list: TreeNode[], log: HistoryEvent[]): Promise<void> {
+  await $.fs.write(pathOfTree(id), `${JSON.stringify({ version: VERSION, name, nodes: list, events: log }, null, 2)}\n`)
+}
+
+// Writes the tree with what another session wrote since this one last looked.
 async function save($: $, list: TreeNode[], log: HistoryEvent[]): Promise<void> {
   try {
-    await $.fs.write(filePath, `${JSON.stringify({ version: VERSION, nodes: list, events: log }, null, 2)}\n`)
+    const disk = await load($)
+    // No file, or one that does not parse: there is nothing to merge with.
+    const isAlone = disk.isMissing || disk.isBroken
+    const merged = isAlone
+      ? { nodes: list, events: log }
+      : { nodes: mergeById(base.nodes, list, disk.nodes), events: mergeById(base.events, log, disk.events) }
+    const isSame =
+      !isAlone &&
+      JSON.stringify(merged.nodes) === JSON.stringify(disk.nodes) &&
+      JSON.stringify(merged.events) === JSON.stringify(disk.events)
+    if (!isSame) await write($, treeId, treeName, merged.nodes, merged.events)
+    base = merged
+    if (JSON.stringify(merged.nodes) !== JSON.stringify(list)) await update($, nodes, () => merged.nodes)
+    if (JSON.stringify(merged.events) !== JSON.stringify(log)) await update($, events, () => merged.events)
   } catch (error) {
-    $.ui.toast(`Дерево не сохранилось в ${FILE}: ${String(error)}`)
+    $.ui.toast(t().notSaved(`${DIR}/${treeFile(treeId)}`, String(error)))
   }
+}
+
+// Takes in what another session wrote, and writes only what this one changed.
+async function sync($: $): Promise<void> {
+  await save($, await read($, nodes), await read($, events))
+}
+
+async function listTrees($: $): Promise<{ id: string; name: string }[]> {
+  const entries = await $.fs.list(`${root}/${DIR}`).catch(() => [])
+  const found = await Promise.all(
+    entries.flatMap(entry => {
+      const id = entry.kind === 'file' ? treeIdOf(entry.name) : null
+      return id === null ? [] : [load($, id).then(one => ({ id, name: shownName(id, one.name) || id }))]
+    }),
+  )
+  const hasMain = found.some(one => one.id === '')
+
+  return [...(hasMain ? [] : [{ id: '', name: shownName('', '') }]), ...found].sort(
+    (a, b) => Number(b.id === '') - Number(a.id === '') || a.name.localeCompare(b.name),
+  )
+}
+
+// Opens a tree in this session; a new session opens the one opened last.
+async function openTree($: $, id: string): Promise<Loaded> {
+  treeId = id
+  const loaded = await load($, id)
+  treeName = loaded.name
+  base = { nodes: loaded.nodes, events: loaded.events }
+  await update($, nodes, () => loaded.nodes)
+  await update($, events, () => loaded.events)
+  await update($, tree, () => id)
+  await $.store.set(pointerKey(), id).catch(() => undefined)
+  // Migration makes new history ids each time, so the migrated file is written as is.
+  if (loaded.isOld) await write($, id, treeName, loaded.nodes, loaded.events)
+  trees = await listTrees($)
+  guide = guideOf(loaded.nodes, loaded.events)
+
+  return loaded
+}
+
+async function switchTree($: $, id: string): Promise<void> {
+  if (id === treeId) return
+  await openTree($, id)
+  await update($, selected, () => '')
+  await update($, removing, () => '')
+  await update($, collapsed, () => [])
+  await update($, tab, () => 'map')
+  $.ui.toast(t().opened(openName()))
+}
+
+// A fresh tree beside the others, which stay as they are.
+async function newTree($: $, name: string): Promise<string> {
+  const id = newId()
+  await write($, id, name, [], [])
+  await switchTree($, id)
+
+  return id
 }
 
 // Every change goes through here, so the file follows the state. Each change
@@ -193,7 +315,34 @@ async function removeWithReason($: $, id: string, reason: string): Promise<void>
   await closeOut($, id, 'removed', { reason: reason.trim() })
 }
 
-// Puts what a step took out back into the tree, and drops the step.
+// Empties a tab in one step of history, so one "put back" returns all of it.
+async function clearTray($: $, tray: Tray, reason: string): Promise<number> {
+  const gone = trayList(await read($, nodes), tray)
+  if (gone.length === 0) return 0
+  const anchor = (await read($, lastPrompt)) ?? undefined
+  const now = Date.now()
+  await commit(
+    $,
+    list => gone.reduce((rest, node) => takeOut(rest, node.id).rest, list),
+    list => [
+      {
+        id: newId(),
+        at: now,
+        kind: 'removed',
+        title: t().clearedTitle(t().trays[tray].label, gone.length),
+        detail: `${reason} ${gone.map(node => `«${node.title}»`).join(', ')}`,
+        anchor,
+        restore: gone.flatMap(node => takeOut(list, node.id).taken),
+      },
+    ],
+  )
+  await update($, selected, at => (gone.some(node => node.id === at) ? '' : at))
+
+  return gone.length
+}
+
+// Puts what a step took out back into the tree, and drops the step. The pane
+// then shows where it went: its tab, its branch unfolded, the node selected.
 async function restore($: $, eventId: string): Promise<void> {
   const step = (await update($, events, same => same)).find(one => one.id === eventId)
   if (!step?.restore?.length) return
@@ -201,6 +350,20 @@ async function restore($: $, eventId: string): Promise<void> {
   const list = await update($, nodes, all => [...all.filter(node => !back.some(one => one.id === node.id)), ...back])
   const log = await update($, events, all => all.filter(one => one.id !== eventId))
   await save($, list, log)
+
+  const node = back.find(one => !back.some(other => other.id === one.parentId)) ?? back[0]
+  if (!node) return
+  const where = trayOf(node)
+  const ancestors = new Set<string>()
+  for (let at = node.parentId; at !== null && !ancestors.has(at); at = list.find(one => one.id === at)?.parentId ?? null) {
+    ancestors.add(at)
+  }
+  await update($, collapsed, ids => ids.filter(id => !ancestors.has(id)))
+  await update($, tab, () => where ?? 'map')
+  await update($, selected, () => node.id)
+  const path = pathOf(list, node.id)
+  const place = where ? t().toTab(t().trays[where].label) : t().toMap(path.join(' › '))
+  $.ui.toast(t().restoredTo(node.title, place))
 }
 
 // Starts a reply to the node in the prompt box, so the person only adds their
@@ -214,21 +377,22 @@ async function reply($: $, node: TreeNode): Promise<void> {
     mode: draft.trim() === '' ? 'replace' : 'append',
     decorations: [{ start: text.length - lead.length, end: text.length, color: KINDS[node.kind].color }],
   })
-  if (!filled.isFilled) $.ui.toast('Не получилось вставить в поле ввода: оно сейчас занято диалогом.')
+  if (!filled.isFilled) $.ui.toast(t().promptBusy)
 }
 
 async function jump($: $, anchor: Anchor): Promise<void> {
   if (anchor.sessionId !== (await $.session.id())) {
-    const when = new Date(anchor.at).toLocaleString('ru-RU')
-    $.ui.toast(`Сообщение из другой сессии (${when}): «${anchor.excerpt}»`)
+    const when = new Date(anchor.at).toLocaleString(t().locale)
+    $.ui.toast(t().otherSession(when, anchor.excerpt))
     return
   }
   const moved = await $.ui.scroll({ to: { requestId: anchor.messageId }, block: 'center' })
-  if (moved.deny !== undefined) $.ui.toast(`Не удалось прокрутить к сообщению: ${moved.deny}`)
+  if (moved.deny !== undefined) $.ui.toast(t().noScroll(moved.deny))
 }
 
 type ToolInput = {
-  action?: 'list' | 'add' | 'update' | 'log'
+  action?: 'list' | 'brief' | 'add' | 'update' | 'log' | 'remove' | 'new' | 'switch'
+  tray?: Tray
   id?: string
   kind?: NodeKind
   title?: string
@@ -240,11 +404,46 @@ type ToolInput = {
 }
 
 async function runTool($: $, input: ToolInput): Promise<string> {
+  if (input.action === 'list' || input.action === undefined) {
+    trees = await listTrees($)
+    // Another session may have written since: show the tree as it stands.
+    await sync($)
+    const all = await read($, nodes)
+    if (input.id !== undefined) {
+      const one = all.find(node => node.id === input.id)
+      return one ? nodeCard(all, one) : t().noNode(input.id)
+    }
+    const others = trees.filter(one => one.id !== treeId).map(one => `«${one.name}» [${one.id || 'main'}]`)
+    const head = `${t().opened(openName())}${others.length ? t().otherTrees(others.join(', ')) : ''}`
+
+    return `${head}\n\n${outline(all, await read($, events))}`
+  }
+
+  if (input.action === 'brief') {
+    await sync($)
+    return `${briefing(openName(), await read($, nodes), await read($, events), Date.now())}\n\n${t().briefAsk}`
+  }
+
+  if (input.action === 'new') {
+    const name = input.title?.trim() || t().treeOf(today())
+    const before = openName()
+    await newTree($, name)
+    return t().newTree(name, before)
+  }
+
+  if (input.action === 'switch') {
+    trees = await listTrees($)
+    const wanted = input.id === 'main' ? '' : input.id
+    const found = trees.find(one => one.id === wanted || one.name === input.title?.trim())
+    if (!found) return t().noSuchTree(trees.map(one => `«${one.name}» [${one.id || 'main'}]`).join(', '))
+    await switchTree($, found.id)
+    return t().opened(found.name)
+  }
+
   const list = await read($, nodes)
-  if (input.action === 'list' || input.action === undefined) return outline(list, await read($, events))
 
   if (input.action === 'log') {
-    if (!input.title?.trim()) return 'Нужен title: что за шаг.'
+    if (!input.title?.trim()) return t().needTitle
     const parent = list.find(node => node.id === input.parentId)
     const path = parent ? [...pathOf(list, parent.id), parent.title] : []
     await record($, {
@@ -256,12 +455,12 @@ async function runTool($: $, input: ToolInput): Promise<string> {
       branch: path.length ? path.join(' › ') : undefined,
       anchor: (await read($, lastPrompt)) ?? undefined,
     })
-    return 'Записано в историю.'
+    return t().logged
   }
 
   if (input.action === 'add') {
     if (!input.kind || !KINDS[input.kind] || !input.title?.trim()) {
-      return 'Нужны kind (branch|task|question|decision|idea|finding|note) и title.'
+      return t().needKind
     }
     const parent = list.find(node => node.id === input.parentId && isOnMap(node))
     const node = makeNode(
@@ -281,13 +480,26 @@ async function runTool($: $, input: ToolInput): Promise<string> {
     await commit($, all => [...all, node])
 
     const tray = trayOf(node)
-    if (tray) return `Добавлено [${node.id}] во вкладку «${TRAYS[tray].label}»: человек решит, брать ли в работу.`
+    if (tray) return t().addedTray(node.id, t().trays[tray].label)
 
-    return parent ? `Добавлено [${node.id}] в «${parent.title}».` : `Добавлено [${node.id}] в корень схемы.`
+    return parent ? t().addedUnder(node.id, parent.title) : t().addedRoot(node.id)
+  }
+
+  if (input.action === 'remove') {
+    const reason = input.detail?.trim() || t().byRequest
+    if (input.tray !== undefined && TRAYS.includes(input.tray)) {
+      const label = t().trays[input.tray].label
+      const count = await clearTray($, input.tray, reason)
+      return count ? t().cleared(label, count) : t().nothingToClear(label)
+    }
+    const gone = list.find(node => node.id === input.id)
+    if (!gone) return input.id === undefined ? t().needTarget : t().noNode(input.id)
+    await closeOut($, gone.id, 'removed', { reason })
+    return t().removed(gone.title)
   }
 
   const target = list.find(node => node.id === input.id)
-  if (!target) return `Узла [${input.id ?? ''}] нет. Вызови action "list", чтобы увидеть id.`
+  if (!target) return t().noNode(input.id ?? '')
   const proposal = {
     ...(input.status !== undefined && input.status !== target.status ? { status: input.status } : {}),
     ...(input.chosen !== undefined ? { chosen: input.chosen } : {}),
@@ -308,33 +520,37 @@ async function runTool($: $, input: ToolInput): Promise<string> {
     ),
   )
 
-  return hasProposal
-    ? `Обновлено [${target.id}]; смена статуса или выбор решения ждёт подтверждения человека на карточке узла.`
-    : `Обновлено [${target.id}].`
+  return hasProposal ? t().updatedAsk(target.id) : t().updated(target.id)
 }
 
 const TOOL_DESCRIPTION = `The project tree the person keeps beside the chat. The map holds branches (features, areas) and the tasks under them. Questions, decisions (with options), ideas, findings and notes wait on their own tabs until the person takes them into work, where they become tasks, or drops them. History records the important steps.
-- action "list": the map, the waiting tabs and recent history, with ids. Call it when the person returns to the project, asks what is open or what to do next.
+- action "list": the map, the waiting tabs and recent history, with ids and the gist of each node's detail. With id: that one node in full. Call it before working on a node, or when the person asks what is open.
+- action "brief": where the project stands, for a person coming back to it: the latest steps, work in progress, what waits on them, what has lain untouched. Call it when the person returns or asks where they left off, and retell it briefly.
 - action "add": a branch, or a task under parentId, goes on the map; a task with no parentId waits on the Ideas tab. Other kinds go to their tab, parentId naming the branch they concern. Add, without being asked, a finding, open question or follow-up idea that turns up during the work and is not being handled right now.
 - action "update": change title, detail or options of a node by id. A new status (open|doing|done|parked) or a chosen option is a proposal the person confirms on the card.
 - action "log": record an important step in history (title, detail, parentId for the branch): a feature added or dropped, a direction decided in chat. Do it unasked when such a step happens. Closing a task or choosing an option records itself.
+- action "remove": only when the person asks to remove a node (id) or to clear a tab (tray: questions|ideas|findings); detail is the reason. What is removed goes to History, where the person can put it back.
+- action "new": when the person asks to clear the tree or start afresh, begin a new empty tree (title: its name). The old tree is kept; never empty it node by node.
+- action "switch": open another tree of the project, by id from "list" ("main" for the main one) or by name in title.
 Write titles in the person's language, short.`
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
-    filePath = `${(await $.session.root()).replace(/\\/g, '/')}/${FILE}`
-    const loaded = await load($)
-    await update($, nodes, () => loaded.nodes)
-    await update($, events, () => loaded.events)
-    if (loaded.isOld) await save($, loaded.nodes, loaded.events)
-    guide = `## Дерево проекта
-Рядом с чатом у человека панель «${TITLE}»: схема с ветками и задачами, вкладки с вопросами, идеями и находками, история важных шагов. Работай с ней инструментом ${TOOL}.
-${digest(loaded.nodes)}`
+    root = (await $.session.root()).replace(/\\/g, '/')
+    // Until the person writes, the language they wrote in last, else the system's.
+    const said = await $.store.get(LANG_KEY).catch(() => undefined)
+    setLang(isLang(said) ? said : systemLang())
+    await update($, language, () => (isLang(said) ? said : systemLang()))
+    // A reload keeps the session's tree; a new session takes the one opened last.
+    const kept = await read($, tree)
+    const last = kept ?? (await $.store.get(pointerKey()).catch(() => undefined))
+    const id = typeof last === 'string' && (last === '' || (await $.fs.exists(pathOfTree(last)).catch(() => false))) ? last : ''
+    await openTree($, id)
 
     await $.command.register({
       name: 'tree',
-      description: 'Дерево проекта: открыть панель, или добавить узел (/tree ? вопрос)',
-      argumentHint: ENTRY_HINT,
+      description: t().command,
+      argumentHint: t().entryHint,
     })
     await $.tool.register({
       name: 'tree',
@@ -343,20 +559,21 @@ ${digest(loaded.nodes)}`
       inputSchema: {
         type: 'object',
         properties: {
-          action: { type: 'string', enum: ['list', 'add', 'update', 'log'] },
-          id: { type: 'string', description: 'Node id for update' },
+          action: { type: 'string', enum: ['list', 'brief', 'add', 'update', 'log', 'remove', 'new', 'switch'] },
+          id: { type: 'string', description: 'Node id for update, remove, or list of one node; tree id for switch' },
+          tray: { type: 'string', enum: [...TRAYS], description: 'For remove: the tab to clear' },
           kind: { type: 'string', enum: Object.keys(KINDS) },
           title: { type: 'string' },
           detail: { type: 'string', description: 'A sentence or two of context' },
           parentId: { type: 'string', description: 'For add and log: the branch or task it belongs to' },
           options: { type: 'array', items: { type: 'string' }, description: 'For decisions' },
-          status: { type: 'string', enum: Object.keys(STATUSES) },
+          status: { type: 'string', enum: [...STATUSES] },
           chosen: { type: 'string', description: 'For decisions: the option chosen' },
         },
         required: ['action'],
       },
     })
-    void $.ui.open({ id: PANE, title: TITLE })
+    void $.ui.open({ id: PANE, title: t().title })
 
     return next(e)
   })
@@ -365,13 +582,16 @@ ${digest(loaded.nodes)}`
     const composed = await next(e)
 
     return {
-      sections: [...composed.sections, { id: 'project-tree:guide', text: guide, scope: 'session' }],
+      sections: [...composed.sections, { id: 'project-tree:guide', text: guide || t().notLoaded, scope: 'session' }],
     }
   })
 
   // A prompt that names a node, as "Ответить" writes it, carries the whole node
-  // to the model: the person sees one line, Claude reads the rest.
+  // to the model: the person sees one line, Claude reads the rest. The prompt
+  // also tells the language the mod speaks; a slash command does not.
   on('prompt.submit', async ($, e, next) => {
+    const said = e.text.trimStart().startsWith('/') ? null : langOf(e.text)
+    if (said) await speak($, said)
     const list = await read($, nodes)
     const briefs = mentionedIds(e.text, list).flatMap(id => {
       const node = list.find(one => one.id === id)
@@ -400,24 +620,37 @@ ${digest(loaded.nodes)}`
     return stored
   }).catch(($, e, next) => next(e))
 
+  // When a turn ends, the pane takes in what other sessions wrote meanwhile.
+  on('turn.complete', async ($, e, next) => {
+    const result = await next(e)
+    await sync($).catch(() => undefined)
+
+    return result
+  }).catch(($, e, next) => next(e))
+
   on('tool.call', { tool: TOOL }, async ($, e) => ({
     result: await runTool($, e as unknown as ToolInput),
-  })).catch(($, e, next) => (next.called ? next(e) : { deny: 'Дерево проекта не ответило: сбой мода.' }))
+  })).catch(($, e, next) => (next.called ? next(e) : { deny: t().toolFailed }))
 
   on('command.run', { command: 'tree' }, async ($, e) => {
     if (e.args.trim() === '') {
-      await $.ui.open({ id: PANE, title: TITLE })
-      return { text: 'Панель дерева открыта.' }
+      await $.ui.open({ id: PANE, title: t().title })
+      return { text: t().paneOpened }
+    }
+    if (/^(brief|бриф|сводка)$/i.test(e.args.trim())) {
+      await sync($)
+      return { text: briefing(openName(), await read($, nodes), await read($, events), Date.now()) }
     }
     const node = await addEntry($, e.args, null)
-    void $.ui.open({ id: PANE, title: TITLE })
+    void $.ui.open({ id: PANE, title: t().title })
 
-    return node
-      ? { text: `Добавлено в дерево: ${KINDS[node.kind].label} «${node.title}».` }
-      : { text: `Не понял, что добавить. ${ENTRY_HINT}` }
+    return node ? { text: t().addedByCommand(t().kinds[node.kind], node.title) } : { text: t().notUnderstood(t().entryHint) }
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+    // Read first: the pane draws again when the person's language changes.
+    setLang(await read($, language))
+    const s = t()
     const table = $.ui.resolve(e)
     const { Box, Text, Button } = table
     const Input = 'Input' in table ? table.Input : undefined
@@ -475,8 +708,8 @@ ${digest(loaded.nodes)}`
 
     const proposalText = (node: TreeNode) =>
       [
-        node.proposal?.status && `статус → ${STATUSES[node.proposal.status]}`,
-        node.proposal?.chosen && `выбрать «${node.proposal.chosen}»`,
+        node.proposal?.status && s.proposalStatus(s.statuses[node.proposal.status]),
+        node.proposal?.chosen && s.proposalChoose(node.proposal.chosen),
       ]
         .filter(Boolean)
         .join(', ')
@@ -487,10 +720,10 @@ ${digest(loaded.nodes)}`
         <Box flexDirection="row" gap={1} flexWrap="wrap">
           <Text color="warning">{`Claude: ${proposalText(node)}`}</Text>
           <Button key={`accept:${node.id}`} variant="primary" onPress={() => void acceptProposal($, node.id)}>
-            Принять
+            {s.accept}
           </Button>
           <Button key={`reject:${node.id}`} onPress={() => void rejectProposal($, node.id)}>
-            Отклонить
+            {s.reject}
           </Button>
         </Box>
       )
@@ -502,18 +735,18 @@ ${digest(loaded.nodes)}`
           {Input && (
             <Input
               key={`why:${node.id}`}
-              label="Почему убираем?"
-              placeholder="причина попадёт в историю"
-              submitLabel="убрать"
+              label={s.why}
+              placeholder={s.whyHint}
+              submitLabel={s.removeVerb}
               onSubmit={text => void removeWithReason($, node.id, text)}
             />
           )}
           <Box flexDirection="row" gap={1}>
             <Button key={`erase:${node.id}`} onPress={() => void erase($, node.id)}>
-              Удалить без следа
+              {s.eraseNoTrace}
             </Button>
             <Button key={`cancel:${node.id}`} onPress={() => void update($, removing, () => '')}>
-              Отмена
+              {s.cancel}
             </Button>
           </Box>
         </Box>
@@ -538,10 +771,10 @@ ${digest(loaded.nodes)}`
       const isSelected = node.id === selectedId
       const inner = cardWidth - 4
       const { done, total } = progressOf(list, node.id)
-      const hidden = childCount > 0 && closed.includes(node.id) ? ` · ▸ ещё ${childCount}` : ''
-      const progress = total > 0 ? ` · подзадачи ${done} из ${total}` : ''
-      const stale = node.kind === 'task' && isStale(node, now) ? ` · не трогали ${ageOf(node.updatedAt, now)}` : ''
-      const meta = `${kind.label} · ${STATUSES[node.status]}${progress}${stale}${hidden}`
+      const hidden = childCount > 0 && closed.includes(node.id) ? s.more(childCount) : ''
+      const progress = total > 0 ? s.subtasks(done, total) : ''
+      const stale = node.kind === 'task' && isStale(node, now) ? s.untouched(ageOf(node.updatedAt, now)) : ''
+      const meta = `${s.kinds[node.kind]} · ${s.statuses[node.status]}${progress}${stale}${hidden}`
 
       return (
         <Box
@@ -568,25 +801,25 @@ ${digest(loaded.nodes)}`
             <Box flexDirection="row" gap={1} flexWrap="wrap">
               {node.kind === 'task' && (
                 <Button key={`done:${node.id}`} plain onPress={() => void setStatus($, node.id, 'done')}>
-                  ✓ Готово
+                  {s.done}
                 </Button>
               )}
               <Button key={`reply:${node.id}`} plain onPress={() => void reply($, node)}>
-                {node.kind === 'task' ? '↪ Ответить' : '↪ Обсудить'}
+                {node.kind === 'task' ? s.reply : s.discuss}
               </Button>
               {node.kind === 'task' && node.status === 'open' && (
                 <Button key={`doing:${node.id}`} plain onPress={() => void setStatus($, node.id, 'doing')}>
-                  ● В работу
+                  {s.toWork}
                 </Button>
               )}
               {node.kind === 'task' && node.status === 'doing' && (
                 <Button key={`park:${node.id}`} plain onPress={() => void setStatus($, node.id, 'parked')}>
-                  ⏸ Отложить
+                  {s.park}
                 </Button>
               )}
               {isParked && (
                 <Button key={`resume:${node.id}`} plain onPress={() => void setStatus($, node.id, 'open')}>
-                  ▶ Вернуть
+                  {s.resume}
                 </Button>
               )}
               <Button key={`remove:${node.id}`} plain onPress={() => askRemoval(node.id)}>
@@ -629,7 +862,7 @@ ${digest(loaded.nodes)}`
 
     // Where a node can go on the map: a branch, or a task to sit under.
     const mapPlaces = (id: string) => [
-      { value: '', label: '— в корень —' },
+      { value: '', label: s.toRoot },
       ...flatten(list, [])
         .filter(row => row.node.id !== id)
         .map(row => ({
@@ -656,7 +889,7 @@ ${digest(loaded.nodes)}`
       const kind = KINDS[node.kind]
       const isSelected = node.id === selectedId
       const asks = node.kind === 'question' || node.kind === 'decision'
-      const who = node.isInbox ? 'задача от Claude без ветки' : node.source === 'claude' ? 'от Claude' : 'твоё'
+      const who = node.isInbox ? s.fromClaudeNoBranch : node.source === 'claude' ? s.fromClaude : s.yours
 
       return (
         <Box
@@ -672,6 +905,7 @@ ${digest(loaded.nodes)}`
             <Text bold>{node.title}</Text>
           </Button>
           {pathLine(node, `${who} · ${ageOf(node.createdAt, now)}`)}
+          {isStale(node, now) && <Text color="warning">{s.lyingLong(ageOf(node.updatedAt, now))}</Text>}
           {node.detail && <Text dimColor>{excerptOf(node.detail, 160)}</Text>}
           {proposalLine(node)}
           {node.kind === 'decision' && (node.options ?? []).length > 0 && (
@@ -687,21 +921,21 @@ ${digest(loaded.nodes)}`
             {Select && (
               <Select
                 key={`take:${node.id}`}
-                label="→ В работу:"
+                label={s.takeIntoWork}
                 options={mapPlaces(node.id)}
                 onSelect={value => void takeIntoWork($, node.id, value || null)}
               />
             )}
             <Button key={`reply:${node.id}`} plain onPress={() => void reply($, node)}>
-              {asks ? '↪ Ответить' : '↪ Обсудить'}
+              {asks ? s.reply : s.discuss}
             </Button>
             {node.kind === 'question' && (
               <Button key={`answered:${node.id}`} plain onPress={() => void closeOut($, node.id, 'answered')}>
-                ✓ Решён
+                {s.answered}
               </Button>
             )}
             <Button key={`dismiss:${node.id}`} plain onPress={() => void erase($, node.id)}>
-              ✕ Не нужно
+              {s.notNeeded}
             </Button>
           </Box>
         </Box>
@@ -723,7 +957,7 @@ ${digest(loaded.nodes)}`
           <Text bold>{day}</Text>
           {steps.map(step => {
             const look = EVENTS[step.kind]
-            const time = new Date(step.at).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' })
+            const time = new Date(step.at).toLocaleTimeString(s.locale, { hour: '2-digit', minute: '2-digit' })
             const under = [step.detail && excerptOf(step.detail, 160), step.branch, time].filter(Boolean).join(' · ')
             return (
               <Box key={`step:${step.id}`} flexDirection="column" marginBottom={1}>
@@ -734,7 +968,7 @@ ${digest(loaded.nodes)}`
                 <Text dimColor>{under}</Text>
                 {(step.restore?.length ?? 0) > 0 && (
                   <Button key={`restore:${step.id}`} plain dimColor onPress={() => void restore($, step.id)}>
-                    ↩ Вернуть
+                    {s.restore}
                   </Button>
                 )}
               </Box>
@@ -748,11 +982,11 @@ ${digest(loaded.nodes)}`
       <Box flexDirection="row" gap={1} flexWrap="wrap">
         {(
           [
-            ['map', 'Схема'],
-            ['questions', `${TRAYS.questions.label} ${trays.questions.length}`],
-            ['ideas', `${TRAYS.ideas.label} ${trays.ideas.length}`],
-            ['findings', `${TRAYS.findings.label} ${trays.findings.length}`],
-            ['history', 'История'],
+            ['map', s.mapTab],
+            ['questions', `${s.trays.questions.label} ${trays.questions.length}`],
+            ['ideas', `${s.trays.ideas.label} ${trays.ideas.length}`],
+            ['findings', `${s.trays.findings.label} ${trays.findings.length}`],
+            ['history', s.historyTab],
           ] as const
         ).map(([id, label]) => (
           <Button
@@ -770,20 +1004,20 @@ ${digest(loaded.nodes)}`
     const body: RenderChildren =
       current === 'map' ? (
         rows.length === 0 ? (
-          <Text dimColor>{`Пусто. Добавь первую ветку ниже, например «# Название проекта».\n${ENTRY_HINT}`}</Text>
+          <Text dimColor>{s.emptyMapHint(s.entryHint)}</Text>
         ) : (
           <Box flexDirection="column">{rows.map((row, at) => mapRow(row, at === 0))}</Box>
         )
       ) : current === 'history' ? (
         log.length === 0 ? (
-          <Text dimColor>Здесь появятся важные шаги: закрытые задачи, принятые решения, убранное с причиной.</Text>
+          <Text dimColor>{s.emptyHistory}</Text>
         ) : (
           <Box flexDirection="column">{historyBody()}</Box>
         )
       ) : (
         <Box flexDirection="column" gap={1}>
           {trays[current as Tray].length === 0 ? (
-            <Text dimColor>{TRAYS[current as Tray].empty}</Text>
+            <Text dimColor>{s.trays[current as Tray].empty}</Text>
           ) : (
             trays[current as Tray].map(trayCard)
           )}
@@ -794,28 +1028,28 @@ ${digest(loaded.nodes)}`
       <Box flexDirection="column" marginTop={1} borderStyle="round" paddingX={1}>
         <Text bold>{`${iconOf(chosen)} ${chosen.title}`}</Text>
         <Text dimColor>
-          {`${KINDS[chosen.kind].label} · ${STATUSES[chosen.status]} · ${chosen.source === 'claude' ? 'добавил Claude' : 'добавил ты'} · ${new Date(chosen.createdAt).toLocaleDateString('ru-RU')}`}
+          {`${s.kinds[chosen.kind]} · ${s.statuses[chosen.status]} · ${chosen.source === 'claude' ? s.addedByClaude : s.addedByYou} · ${new Date(chosen.createdAt).toLocaleDateString(s.locale)}`}
         </Text>
         {pathOf(list, chosen.id).length > 0 && (
-          <Text dimColor>{`в ветке: ${pathOf(list, chosen.id).join(' › ')}`}</Text>
+          <Text dimColor>{s.inBranch(pathOf(list, chosen.id).join(' › '))}</Text>
         )}
         {chosen.detail && <Text>{chosen.detail}</Text>}
         {chosen.kind === 'decision' &&
           (chosen.options ?? []).map(option => <Text>{`◇ ${option}`}</Text>)}
         {chosen.anchor ? (
           <Box flexDirection="column" marginTop={1}>
-            <Text dimColor>{`Из сообщения ${new Date(chosen.anchor.at).toLocaleString('ru-RU')}: «${chosen.anchor.excerpt}»`}</Text>
+            <Text dimColor>{s.fromMessage(new Date(chosen.anchor.at).toLocaleString(s.locale), chosen.anchor.excerpt)}</Text>
             {/* The desktop keeps the transcript to the person; the terminal lets a plugin scroll it. */}
             {e.surface === 'terminal' && (
               <Button key="jump" onPress={() => void jump($, chosen.anchor as Anchor)}>
-                ↩ К сообщению в чате
+                {s.jump}
               </Button>
             )}
           </Box>
         ) : (
           // A node made before any prompt was seen has no source; let the person give it one.
           <Box flexDirection="column" marginTop={1}>
-            <Text dimColor>Не привязано к сообщению чата.</Text>
+            <Text dimColor>{s.unanchored}</Text>
             {latest && (
               <Button
                 key="anchor"
@@ -823,7 +1057,7 @@ ${digest(loaded.nodes)}`
                   void commit($, all => patch(all, chosen.id, node => ({ ...node, anchor: latest }), Date.now()))
                 }
               >
-                {`📌 Привязать к «${fit(latest.excerpt, Math.max(10, width - 20))}»`}
+                {s.anchorTo(fit(latest.excerpt, Math.max(10, width - 20)))}
               </Button>
             )}
           </Box>
@@ -831,7 +1065,7 @@ ${digest(loaded.nodes)}`
         {isOnMap(chosen) && Select && (
           <Select
             key="place"
-            label="Перенести в:"
+            label={s.moveTo}
             value={chosen.parentId ?? ''}
             options={mapPlaces(chosen.id)}
             onSelect={value => void place($, chosen.id, value || null)}
@@ -839,7 +1073,7 @@ ${digest(loaded.nodes)}`
         )}
         <Box flexDirection="row" gap={1} flexWrap="wrap">
           {isOnMap(chosen) && chosen.kind === 'task' && chosen.status !== 'parked' && (
-            <Button key="park" onPress={() => void setStatus($, chosen.id, 'parked')}>Отложить</Button>
+            <Button key="park" onPress={() => void setStatus($, chosen.id, 'parked')}>{s.parkPlain}</Button>
           )}
           <Button key="unselect" onPress={() => void update($, selected, () => '')}>×</Button>
         </Box>
@@ -847,9 +1081,27 @@ ${digest(loaded.nodes)}`
     )
 
     const parentForNew = chosen && isOnMap(chosen) ? chosen : undefined
+    // The project's trees; the session keeps to the one it opened.
+    const shelf = Select && (
+      <Select
+        key="trees"
+        label={s.treeLabel}
+        value={(await read($, tree)) ?? treeId}
+        options={[
+          ...trees.map(one => ({ value: one.id, label: fit(one.name, width - 12) })),
+          { value: '+new', label: s.newTreeOption },
+        ]}
+        onSelect={value =>
+          void (value === '+new'
+            ? newTree($, s.treeOf(today()))
+            : switchTree($, value))
+        }
+      />
+    )
 
     return (
       <Box flexDirection="column">
+        {shelf}
         {tabs}
         <Box flexDirection="column" marginTop={1}>
           {body}
@@ -860,8 +1112,8 @@ ${digest(loaded.nodes)}`
             <Input
               key={`add:${seq}`}
               label="+"
-              placeholder={parentForNew ? `в «${fit(parentForNew.title, 20)}»: ${ENTRY_HINT}` : ENTRY_HINT}
-              submitLabel="добавить"
+              placeholder={parentForNew ? s.addInto(fit(parentForNew.title, 20), s.entryHint) : s.entryHint}
+              submitLabel={s.addVerb}
               onSubmit={text =>
                 void (async () => {
                   const node = await addEntry($, text, parentForNew?.id ?? null)
